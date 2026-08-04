@@ -1,0 +1,12 @@
+.env
+.venv/
+venv/
+konsoloslukbot/
+__pycache__/
+*.pyc
+konsolosluk_kontrol.log
+konsolosluk_sayfa.png
+konsolosluk_sayfa_metni.txt
+konsolosluk_hata.png
+konsolosluk_hata.html
+konsolosluk_hata_metni.txt
