@@ -1,0 +1,73 @@
+name: Düsseldorf Konsolosluk Botu
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "3,13,23,33,43,53 * * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: konsolosluk-bot
+  cancel-in-progress: false
+
+jobs:
+  kontrol:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+
+    env:
+      HEADLESS: "true"
+      TWILIO_ACCOUNT_SID: ${{ secrets.TWILIO_ACCOUNT_SID }}
+      TWILIO_AUTH_TOKEN: ${{ secrets.TWILIO_AUTH_TOKEN }}
+      TWILIO_WHATSAPP_TO: ${{ secrets.TWILIO_WHATSAPP_TO }}
+      TWILIO_WHATSAPP_FROM: ${{ secrets.TWILIO_WHATSAPP_FROM }}
+      TWILIO_CONTENT_SID: ${{ secrets.TWILIO_CONTENT_SID }}
+
+    steps:
+      - name: Repository'yi indir
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Python kur
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Python paketlerini kur
+        run: pip install -r requirements.txt
+
+      - name: Chromium ve sistem bağımlılıklarını kur
+        run: python -m playwright install --with-deps chromium
+
+      - name: Randevuyu kontrol et
+        run: python konsolosluk_kontrol.py
+
+      - name: Bildirim state dosyasını kaydet
+        if: success()
+        run: |
+          if git diff --quiet -- konsolosluk_state.json; then
+            echo "State değişmedi. Commit yapılmayacak."
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add konsolosluk_state.json
+            git commit -m "Update appointment notification state"
+            git push
+          fi
+
+      - name: Hata dosyalarını yükle
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: konsolosluk-hata-${{ github.run_number }}
+          path: |
+            konsolosluk_kontrol.log
+            konsolosluk_hata.png
+            konsolosluk_hata.html
+            konsolosluk_hata_metni.txt
+          if-no-files-found: ignore
+          retention-days: 1
