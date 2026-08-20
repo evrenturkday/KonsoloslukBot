@@ -49,6 +49,8 @@ HEADLESS = True
 PAGE_TIMEOUT_MS = 60_000
 MISSION_LOAD_TIMEOUT_SECONDS = 40
 APPOINTMENT_LOAD_WAIT_MS = 7_000
+ACCESS_RETRY_WAIT_SECONDS = (10, 30, 60)
+MAX_ACCESS_ATTEMPTS = len(ACCESS_RETRY_WAIT_SECONDS) + 1
 
 LOG_FILE = BASE_DIR / "konsolosluk_kontrol.log"
 STATE_FILE = BASE_DIR / "konsolosluk_state.json"
@@ -117,6 +119,46 @@ def required_env(name: str) -> str:
         )
 
     return value.strip()
+
+
+class ConsulateAccessError(RuntimeError):
+    """Konsolosluk sitesi isteği engellediğinde veya erişilemediğinde kullanılır."""
+
+
+def ensure_consulate_page_is_accessible(
+    page: Page,
+    http_status: Optional[int] = None,
+) -> None:
+    """403/Blist gibi engel sayfalarının normal sayfa sanılmasını önler."""
+
+    try:
+        body_text = normalize_text(page.locator("body").inner_text())
+    except Exception:
+        body_text = ""
+
+    folded_text = body_text.casefold()
+    block_markers = (
+        "erişim engellendi",
+        "erisim engellendi",
+        "blist",
+        "access denied",
+        "forbidden",
+    )
+
+    if (
+        http_status in {401, 403, 429, 503}
+        or any(marker in folded_text for marker in block_markers)
+    ):
+        status_text = (
+            str(http_status)
+            if http_status is not None
+            else "bilinmiyor"
+        )
+        raise ConsulateAccessError(
+            "Konsolosluk sitesi erişimi engelledi "
+            f"(HTTP {status_text}). Bu sayfadan tarih okunmadı "
+            "ve bildirim gönderilmedi."
+        )
 
 
 def parse_date(value: str) -> Optional[date]:
@@ -848,7 +890,7 @@ def prepare_consulate_session(
         HOME_URL,
     )
 
-    page.goto(
+    response = page.goto(
         HOME_URL,
         wait_until="domcontentloaded",
         timeout=PAGE_TIMEOUT_MS,
@@ -856,6 +898,11 @@ def prepare_consulate_session(
 
     page.wait_for_timeout(
         4_000
+    )
+
+    ensure_consulate_page_is_accessible(
+        page,
+        response.status if response is not None else None,
     )
 
     logger.info(
@@ -1084,60 +1131,96 @@ def create_browser_context(
 def check_appointment_page() -> date:
     """
     Almanya ve Düsseldorf seçimini yapar.
-    Aynı oturumda randevu sayfasını açar.
-    Tarihi okur.
+    Erişim engeli/zaman aşımında temiz oturumla yeniden dener.
+    Tarihi yalnızca doğrulanmış tablodan okur.
     """
+
+    last_error: Optional[Exception] = None
 
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(
             headless=HEADLESS,
         )
 
-        context = create_browser_context(
-            browser
-        )
-
-        page = context.new_page()
-
-        page.set_default_timeout(
-            PAGE_TIMEOUT_MS
-        )
-
         try:
-            prepare_consulate_session(
-                page
-            )
+            for attempt in range(1, MAX_ACCESS_ATTEMPTS + 1):
+                context = create_browser_context(
+                    browser
+                )
+                page = context.new_page()
+                page.set_default_timeout(
+                    PAGE_TIMEOUT_MS
+                )
 
-            open_appointment_page(
-                page
-            )
+                logger.info(
+                    "Konsolosluk erişim denemesi: %s/%s",
+                    attempt,
+                    MAX_ACCESS_ATTEMPTS,
+                )
 
-            save_page_debug_files(
-                page
-            )
+                try:
+                    prepare_consulate_session(
+                        page
+                    )
+                    open_appointment_page(
+                        page
+                    )
+                    ensure_consulate_page_is_accessible(
+                        page
+                    )
+                    save_page_debug_files(
+                        page
+                    )
 
-            appointment_date = extract_appointment_date(
-                page
-            )
+                    appointment_date = extract_appointment_date(
+                        page
+                    )
 
-            logger.info(
-                "Düsseldorf için bulunan randevu tarihi: %s",
-                appointment_date.strftime(
-                    "%d.%m.%Y"
-                ),
-            )
+                    logger.info(
+                        "Düsseldorf için bulunan randevu tarihi: %s",
+                        appointment_date.strftime("%d.%m.%Y"),
+                    )
+                    return appointment_date
 
-            return appointment_date
+                except (ConsulateAccessError, PlaywrightTimeoutError) as exc:
+                    last_error = exc
+                    save_error_files(
+                        page
+                    )
 
-        except Exception:
-            save_error_files(
-                page
-            )
-            raise
+                    if attempt >= MAX_ACCESS_ATTEMPTS:
+                        break
+
+                    wait_seconds = ACCESS_RETRY_WAIT_SECONDS[
+                        attempt - 1
+                    ]
+                    logger.warning(
+                        "Konsolosluk sitesine erişilemedi: %s "
+                        "Temiz oturumla %s saniye sonra yeniden denenecek.",
+                        exc,
+                        wait_seconds,
+                    )
+                    time.sleep(
+                        wait_seconds
+                    )
+
+                except Exception:
+                    save_error_files(
+                        page
+                    )
+                    raise
+
+                finally:
+                    context.close()
 
         finally:
-            context.close()
             browser.close()
+
+    raise ConsulateAccessError(
+        f"Konsolosluk sitesine {MAX_ACCESS_ATTEMPTS} denemede erişilemedi. "
+        "Tarih okunmadı ve WhatsApp bildirimi gönderilmedi. "
+        f"Son hata: {last_error}"
+    )
 
 
 # ============================================================
